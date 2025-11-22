@@ -1,86 +1,168 @@
-#include<linux/module.h>        // micro MODULE_LICENSE
-#include<linux/init.h>          // module_init/exit
-#include<linux/i2c.h>           // struct i2c_client, i2c_driver
-#include<linux/kernel.h>        // pr_info
-#include<linux/sysfs.h>         // sysfs_create_file
-#include<linux/device.h>        // device_create_file 
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/i2c.h>
+#include <linux/kernel.h>
+#include <linux/sysfs.h>
+#include <linux/device.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/string.h>
 
-/* * Sysfs callback function
- * When user read the sysfs file, this function will be called.
+#define DEVICE_NAME "my_eeprom"
+#define CLASS_NAME "my_eeprom_class"
+
+/* * Global variables
  */
-static ssize_t my_test_write_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+static dev_t dev_num;           // major/minor number
+static struct class *my_class;  // device class
+static struct cdev my_cdev;     // handle for this device
 
-    struct i2c_client *client = to_i2c_client(dev);
-    int ret;
-    
-    /* * Prepare Transaction Buffer
-     * 24c64 (8KB) is 2 bytes (16-bit) address
-     * send sequence high byte -> low byte -> data
-     */
-    u8 tx_buf[3];
-    
-    tx_buf[0] = 0x00; // Memory Address High
-    tx_buf[1] = 0x00; // Memory Address Low  -> address 0x0000
-    tx_buf[2] = 0xAB; // Data (0xAB)
+/* * Open function
+ */
+static int my_open(struct inode *inode, struct file *file) {
+    pr_info("MY_DRIVER: Device opened\n");
+    return 0;
+}
 
-    pr_info("MY_EEPROM: [Write Test] User triggered write!\n");
-    pr_info("MY_EEPROM: Writing Data(0xAB) to Address(0x0000)...\n");
-
-    /* * Core I2C send function
-     * client: I2C device instance
-     * tx_buf: transaction buffer
-     * 3: length (2 byte addr + 1 byte data)
-     */
-    ret = i2c_master_send(client, tx_buf, 3);
+/* * Read function
+ * When user use cat, this will reture the hardcore string
+ * file: who open me
+ * use_buf: buffer that will going to show to user space on (user space address)
+ * count: how many data user want to read
+ * ppos: more lake a offset, it is record to make the process begin.(current position)
+ */
+static ssize_t my_read(struct file *file, char __user *user_buf, size_t count, loff_t *ppos) {
+    int ret = 0;
     
-    if (ret < 0) {
-        pr_err("MY_EEPROM: I2C Write failed! Error code: %d\n", ret);
-        return ret; // return errpr
+    // Hardcoded data
+    char *data = "Hello! This is hardcoded data.\n";
+    size_t data_len = strlen(data);
+    
+    // check if is exceed (EOF)
+    if(*ppos >= data_len) return 0;  // 【修正】用 >= 比較安全
+    
+    // check if the length user want to read will exceed the max memory size
+    if(count > data_len - *ppos) {
+        count = data_len - *ppos;
     }
 
-    pr_info("MY_EEPROM: Write success! Sent %d bytes to hardware.\n", ret);
+    // start to copy the data from kernel to user
+    if(copy_to_user(user_buf, data + *ppos, count) != 0) {
+        ret = -EFAULT;
+        return ret;
+    }
     
-    // because this function is trigger by echo, echo need a return value
+    // update position
+    *ppos += count;
+    
+    ret = count;
+    return ret;
+}    
+
+/* * Write function
+ * When user use write() or echo, this function will be called
+ * user_buf: data user want to write
+ * count: data length
+ */static ssize_t my_write(struct file *file, const char __user *user_buf, size_t count, loff_t *ppos) {
+    // max write size
+    char kbuf[128];
+    int ret = 0;
+    
+    // avoid buffer overflow
+    // reserve 1 byte for '\0'
+    if(count > sizeof(kbuf) - 1) {
+        count = sizeof(kbuf) - 1;
+    }
+    
+    // copy data
+    if(copy_from_user(kbuf, user_buf, count) != 0) {
+        ret = -EFAULT;
+        return ret;
+    }
+    
+    kbuf[count] = '\0';
+    
+    pr_info("MY_DRIVER: User wrote: %s\n", kbuf);
+    
+    // tell user how many data we save
     return count;
 }
 
-/* * Define Sysfs file attribute 
- * file name: my_test_write (/sys/bus/i2c/device/xxxx/"file name")
- * Authority: 0200 (S_IWUSR - only owner can write)
- * Show function: NULL (no read access)
- * Store function: my_test_write_store (callback function when write is trigger)
- */
-static DEVICE_ATTR(my_test_write, 0200, NULL, my_test_write_store);
+// define file operation
+static struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .open = my_open,
+    .read = my_read,
+    .write = my_write,
+};
+
 
 /* * Probe function 
  * When a device address is added through new_device and it's name is the same as
  * name in id_table. This function will be called by kernel.
  */
-static int my_eeprom_probe(struct i2c_client *client){
-    int ret;
+static int my_probe(struct i2c_client *client){
+    int ret = 0;
+    
     pr_info("MY_EEPROM: Probe called! Found device at 0x%02x\n", client->addr);
-
-    /* * create our write method under sysfs
-     * device_create_file will put our my_test_write structure under sysfs
-     * The path will be like： /sys/bus/i2c/devices/1-0050/my_test_write
-     */
-    ret = device_create_file(&client->dev, &dev_attr_my_test_write);
-    if (ret) {
-        pr_err("MY_EEPROM: Failed to create sysfs file\n");
+    
+    // request device driver major/minor number
+    ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
+    if(ret < 0) {
+        pr_err("MY_EEPROM: Fail to alloc chardev region\n");
         return ret;
     }
     
-    pr_info("MY_EEPROM: Sysfs interface 'my_test_write' created successfully.\n");
+    // create device class
+    // for kernel 6.x 
+    my_class = class_create(CLASS_NAME);
+    if (IS_ERR(my_class)) {
+        pr_err("MY_DRIVER: Failed to create class\n");
+        ret = PTR_ERR(my_class);
+        goto err_unregister;
+    }
+
+    // init c dev
+    cdev_init(&my_cdev, &fops);
+    
+    // add c dev to kernel
+    ret = cdev_add(&my_cdev, dev_num, 1);
+    if (ret < 0) {
+        pr_err("MY_DRIVER: Failed to add cdev\n");
+        goto err_class;
+    }
+
+    // create device node in /dev
+    if (IS_ERR(device_create(my_class, NULL, dev_num, NULL, DEVICE_NAME))) {
+        pr_err("MY_DRIVER: Failed to create device\n");
+        ret = -1;
+        goto err_cdev;
+    }
+
+    pr_info("MY_DRIVER: Success! /dev/%s created.\n", DEVICE_NAME);
     return 0;
+
+// goto error handlers
+err_cdev:
+    cdev_del(&my_cdev);
+err_class:
+    class_destroy(my_class);
+err_unregister:
+    unregister_chrdev_region(dev_num, 1);
+    return ret;
 }
 
 /* * Remove function 
  * When rmmod or delete_device called, this function trigger.
  */
-static void my_eeprom_remove(struct i2c_client *client) {     
-    // remove file under sysfs to avoid crash
-    device_remove_file(&client->dev, &dev_attr_my_test_write);
-    pr_info("MY_EEPROM: Sysfs file removed. Goodbye!\n");
+static void my_remove(struct i2c_client *client)
+{
+    device_destroy(my_class, dev_num);     // delete /dev node
+    cdev_del(&my_cdev);                    // delete cdev
+    class_destroy(my_class);               // delete class
+    unregister_chrdev_region(dev_num, 1);  // uregister major/minor number
+    pr_info("MY_DRIVER: Removed!\n");
 }
 
 /* * ID Table
@@ -90,7 +172,7 @@ static void my_eeprom_remove(struct i2c_client *client) {
 static const struct i2c_device_id my_eeprom_id[] = {
         {"my_24c64", 0},
         {}
-        };
+};
 
 /* * Regist in i2c subsystem
  */
@@ -103,18 +185,16 @@ static struct i2c_driver my_eeprom_driver = {
         .driver = {
                 .name = "my_eeprom_driver",
                 .owner = THIS_MODULE,
-                },
-        .probe = my_eeprom_probe,
-        .remove = my_eeprom_remove,
+        },
+        .probe = my_probe,
+        .remove = my_remove,
         .id_table = my_eeprom_id,
-        };
+};
 
 /* * Regist micro
  */
 module_i2c_driver(my_eeprom_driver);
  
- /* * Module information
-  */
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Brian Yeh");
-MODULE_DESCRIPTION("A simple hello world i2c driver kernel 6.x+)");
+MODULE_DESCRIPTION("A simple hello world i2c driver kernel 6.x+");
